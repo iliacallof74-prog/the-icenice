@@ -7,7 +7,7 @@ from flask_wtf import FlaskForm
 from wtforms import StringField, PasswordField, SelectField, TextAreaField, SubmitField
 from wtforms.validators import DataRequired, Length
 from werkzeug.security import generate_password_hash, check_password_hash
-from sqlalchemy import inspect, text
+from sqlalchemy import inspect, text, or_
 
 app = Flask(__name__)
 app.config["SECRET_KEY"] = os.environ.get("SECRET_KEY", "change-this-before-deploying")
@@ -274,8 +274,40 @@ def diplomacy():
     if current_user.role == "admin":
         items = DiplomaticRequest.query.order_by(DiplomaticRequest.created_at.desc()).all()
     else:
-        items = DiplomaticRequest.query.filter_by(user_id=current_user.id).order_by(DiplomaticRequest.created_at.desc()).all()
+        # Players see proposals they sent and proposals addressed to their country.
+        # A request appears only once even when both conditions match.
+        items = DiplomaticRequest.query.filter(
+            or_(
+                DiplomaticRequest.user_id == current_user.id,
+                DiplomaticRequest.target_country_id == current_user.country_id,
+            )
+        ).order_by(DiplomaticRequest.created_at.desc()).all()
     return render_template("diplomacy.html", form=form, requests=items)
+
+@app.route("/diplomacy/respond/<int:req_id>", methods=["POST"])
+@login_required
+def diplomacy_respond(req_id):
+    proposal = db.session.get(DiplomaticRequest, req_id)
+    if not proposal:
+        abort(404)
+    # Only the owner of the addressed country or the admin can decide a proposal.
+    is_target_owner = (
+        current_user.role != "admin"
+        and current_user.country_id is not None
+        and proposal.target_country_id == current_user.country_id
+    )
+    if current_user.role != "admin" and not is_target_owner:
+        abort(403)
+    if proposal.status != "در انتظار بررسی":
+        flash("این پیشنهاد قبلاً تعیین تکلیف شده است.", "error")
+        return redirect(url_for("diplomacy"))
+    decision = request.form.get("decision", "")
+    if decision not in ("پذیرفته شد", "رد شد"):
+        abort(400)
+    proposal.status = decision
+    db.session.commit()
+    flash("پیشنهاد دیپلماتیک " + decision + ".", "success")
+    return redirect(url_for("diplomacy"))
 
 @app.route("/shop")
 @login_required
