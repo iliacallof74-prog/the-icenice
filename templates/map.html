@@ -1,0 +1,23 @@
+{% extends "base.html" %}{% set title="نقشه" %}{% block content %}
+<section class="hero compact"><div class="eyebrow">WORLD STATUS BOARD</div><h1>🗺️ نقشهٔ جهانی ICE Nice</h1><p>نشانگر هر کشور بر اساس رنگ و وضعیت ذخیره‌شده در پنل مالک نمایش داده می‌شود. تغییرات مدیر پس از ذخیره در همین نقشه دیده می‌شود.</p></section>
+<div class="map-legend"><span><i class="dot green"></i> آزاد</span><span><i class="dot red"></i> تحت کنترل</span><span><i class="dot" style="background:#f4c96b"></i> درگیر جنگ</span><span>برای جزئیات، روی نشانگر کشور بزن.</span></div>
+<div id="world-map" class="world-map" role="img" aria-label="نقشهٔ جهانی کشورهای بازی"></div>
+<section class="section-block"><h2>📍 فهرست کشورها و گروه‌ها</h2><div class="country-grid">{% for c in countries %}<article class="country-card" style="--country-color:{{ c.color }}"><div class="country-banner" style="background:linear-gradient(120deg,{{ c.color }},#172338)"></div><div class="country-card-body"><span class="big-flag">{{ c.flag }}</span><div><b>{{ c.name }}</b><small>{{ c.status }}</small></div></div></article>{% endfor %}</div></section>
+{% if current_user.is_authenticated and current_user.role == 'admin' %}<p><a class="btn" href="{{ url_for('admin') }}">⚙️ ویرایش نقشه از پنل مالک</a></p>{% endif %}
+<link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css" integrity="sha256-p4NxAoJBhIIN+hmNHrzRCf9tD/miZyoHS5obTRR9BMY=" crossorigin=""/>
+<script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js" integrity="sha256-20nQCchB9co0qIjJZRGuk2/Z9VM+kNiyxNV1lvTlZBo=" crossorigin=""></script>
+<script>
+(function(){
+ const points={{ map_points|tojson }};
+ const el=document.getElementById('world-map');
+ if(!el||!window.L){el.innerHTML='<p style="padding:24px">نقشهٔ تعاملی بارگذاری نشد؛ فهرست کشورها در پایین صفحه موجود است.</p>';return;}
+ const map=L.map(el,{worldCopyJump:true,scrollWheelZoom:false}).setView([25,15],2);
+ L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png',{maxZoom:7,attribution:'&copy; OpenStreetMap'}).addTo(map);
+ points.forEach(p=>{
+  const marker=L.circleMarker([p.lat,p.lon],{radius:7,color:p.color,fillColor:p.color,fillOpacity:.9,weight:2}).addTo(map);
+  marker.bindPopup('<div dir="rtl" style="font-family:Arial,sans-serif;min-width:150px"><strong>'+p.flag+' '+p.name+'</strong><br><span>'+p.status+'</span></div>');
+  marker.bindTooltip(p.flag+' '+p.name,{direction:'top',opacity:.95});
+ });
+})();
+</script>
+{% endblock %}

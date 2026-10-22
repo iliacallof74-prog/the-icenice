@@ -1,0 +1,4 @@
+{% extends "base.html" %}{% set title="ابرقدرت‌ها" %}{% block content %}
+<section class="hero compact"><div class="eyebrow">GLOBAL POWER INDEX</div><h1>🏆 ابرقدرت‌های جهان</h1><p>فهرست قدرت‌های برتر در سناریوی ICE Nice؛ ترتیب را مالک سایت مدیریت می‌کند.</p></section>
+<div class="power-grid">{% for p in top20 %}<article class="power-card" style="--flag-color: {{ p.color }}"><div class="power-rank">{{ "%02d"|format(p.superpower_rank) }}</div><div class="flag-back">{{ p.flag }}</div><div class="power-name"><span>{{ p.flag }}</span><b>{{ p.name }}</b></div><div class="power-line"></div></article>{% else %}<p>هنوز رتبه‌ای تعیین نشده است.</p>{% endfor %}</div>
+{% endblock %}

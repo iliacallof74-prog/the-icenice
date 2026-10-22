@@ -1,0 +1,4 @@
+{% extends "base.html" %}{% set title="کشورها" %}{% block content %}
+<section class="hero compact"><div class="eyebrow">PLAYABLE NATIONS</div><h1>🌍 کشورها و گروه‌های قابل انتخاب</h1><p>کشور یا گروهی که وضعیت آن آزاد باشد، هنگام ثبت‌نام قابل انتخاب است.</p></section>
+<div class="country-grid">{% for c in countries %}<article class="country-card" style="--country-color:{{ c.color }}"><div class="country-banner" style="background:linear-gradient(120deg,{{ c.color }},#172338)"></div><div class="country-card-body"><span class="big-flag">{{ c.flag }}</span><div><b>{{ c.name }}</b><small>{{ 'گروه / سازمان' if c.category == 'organization' else 'کشور' }} · {{ c.status }}</small></div><span class="availability {{ 'taken' if c.owner_id else '' }}">{{ 'انتخاب شده' if c.owner_id else 'آزاد' }}</span></div></article>{% endfor %}</div>
+{% endblock %}
