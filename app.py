@@ -1,4 +1,5 @@
 import os
+import uuid
 from datetime import datetime
 from flask import Flask, render_template, redirect, url_for, request, flash, abort
 from urllib.parse import urlencode
@@ -11,6 +12,7 @@ from wtforms.validators import DataRequired, Length
 from werkzeug.security import generate_password_hash, check_password_hash
 from werkzeug.utils import secure_filename
 from sqlalchemy import inspect, text, or_
+from sqlalchemy.exc import IntegrityError
 
 app = Flask(__name__)
 app.config["SECRET_KEY"] = os.environ.get("SECRET_KEY", "change-this-before-deploying")
@@ -19,6 +21,8 @@ if db_url.startswith("postgres://"):
     db_url = db_url.replace("postgres://", "postgresql://", 1)
 app.config["SQLALCHEMY_DATABASE_URI"] = db_url
 app.config["SQLALCHEMY_TRACK_MODIFICATIONS"] = False
+# News uploads are limited to 100 MB per request to avoid accidental oversized uploads.
+app.config["MAX_CONTENT_LENGTH"] = 100 * 1024 * 1024
 db = SQLAlchemy(app)
 login_manager = LoginManager(app)
 login_manager.login_view = "login"
@@ -278,8 +282,23 @@ def superpowers():
 def news_page():
     form = NewsForm()
     if current_user.is_authenticated and current_user.role == "admin" and form.validate_on_submit():
-        db.session.add(News(title=form.title.data.strip(), body=form.body.data.strip(), target=form.target.data, image_url=(request.form.get("image_url") or "").strip()[:500], video_url=(request.form.get("video_url") or "").strip()[:500]))
-        db.session.commit(); flash("خبر منتشر شد.", "success"); return redirect(url_for("news_page"))
+        image_url = (request.form.get("image_url") or "").strip()[:500]
+        video_url = (request.form.get("video_url") or "").strip()[:500]
+        try:
+            uploaded_image = save_news_media(request.files.get("image_file"), "image")
+            uploaded_video = save_news_media(request.files.get("video_file"), "video")
+            if uploaded_image:
+                image_url = uploaded_image
+            if uploaded_video:
+                video_url = uploaded_video
+        except ValueError as exc:
+            flash(str(exc), "error")
+            return redirect(url_for("news_page"))
+        db.session.add(News(title=form.title.data.strip(), body=form.body.data.strip(), target=form.target.data,
+                            image_url=image_url, video_url=video_url))
+        db.session.commit()
+        flash("خبر منتشر شد.", "success")
+        return redirect(url_for("news_page"))
     items = News.query.order_by(News.created_at.desc()).all()
     return render_template("news.html", news=items, form=form)
 
@@ -460,6 +479,27 @@ def save_shop_image(upload):
     upload.save(os.path.join(upload_dir, filename))
     return url_for("static", filename="uploads/" + filename)
 
+
+def save_news_media(upload, media_type):
+    """Save an uploaded news image or video under static/uploads with a unique filename."""
+    if not upload or not upload.filename:
+        return None
+    filename = secure_filename(upload.filename)
+    ext = os.path.splitext(filename)[1].lower()
+    allowed = {
+        "image": {".png", ".jpg", ".jpeg", ".webp", ".gif"},
+        "video": {".mp4", ".webm", ".mov", ".m4v", ".ogv"},
+    }
+    if not filename or ext not in allowed.get(media_type, set()):
+        if media_type == "video":
+            raise ValueError("فرمت ویدیو باید MP4، WEBM، MOV، M4V یا OGV باشد.")
+        raise ValueError("فرمت عکس باید PNG، JPG، WEBP یا GIF باشد.")
+    upload_dir = os.path.join(app.static_folder, "uploads")
+    os.makedirs(upload_dir, exist_ok=True)
+    stored_name = f"news_{media_type}_{uuid.uuid4().hex}{ext}"
+    upload.save(os.path.join(upload_dir, stored_name))
+    return url_for("static", filename="uploads/" + stored_name)
+
 @app.route("/admin", methods=["GET", "POST"])
 @login_required
 def admin():
@@ -549,7 +589,28 @@ def admin():
         elif action == "shop_delete":
             item = db.session.get(ShopItem, request.form.get("item_id", type=int))
             if item:
-                db.session.delete(item); db.session.commit(); flash("آیتم از شاپ حذف شد.", "success")
+                # Preserve historical orders. Any FK restriction falls back to safely hiding the item.
+                has_orders = ShopPaymentOrder.query.filter_by(item_id=item.id).first() is not None
+                if has_orders:
+                    item.active = False
+                    item.quantity = 0
+                    db.session.commit()
+                    flash("این محصول در سفارش‌های قبلی ثبت شده بود؛ برای حفظ سوابق خرید، از شاپ غیرفعال شد.", "success")
+                else:
+                    try:
+                        db.session.delete(item)
+                        db.session.commit()
+                        flash("آیتم از شاپ حذف شد.", "success")
+                    except IntegrityError:
+                        db.session.rollback()
+                        item = db.session.get(ShopItem, request.form.get("item_id", type=int))
+                        if item:
+                            item.active = False
+                            item.quantity = 0
+                            db.session.commit()
+                            flash("به دلیل وجود سابقهٔ مرتبط، محصول برای حفظ اطلاعات غیرفعال شد.", "success")
+                        else:
+                            flash("محصول قبلاً حذف شده است.", "success")
         elif action == "rank":
             c = db.session.get(Country, request.form.get("country_id", type=int))
             rank = request.form.get("rank", type=int)
