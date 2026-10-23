@@ -9,6 +9,7 @@ from flask_wtf import FlaskForm
 from wtforms import StringField, PasswordField, SelectField, TextAreaField, SubmitField
 from wtforms.validators import DataRequired, Length
 from werkzeug.security import generate_password_hash, check_password_hash
+from werkzeug.utils import secure_filename
 from sqlalchemy import inspect, text, or_
 
 app = Flask(__name__)
@@ -82,6 +83,7 @@ class User(db.Model, UserMixin):
     country_id = db.Column(db.Integer, db.ForeignKey("country.id"), nullable=True)
     balance = db.Column(db.Integer, default=0, nullable=False)
     badges = db.Column(db.String(500), default="", nullable=False)
+    diplomacy_blocked = db.Column(db.Boolean, default=False, nullable=False)
     country = db.relationship("Country", foreign_keys=[country_id])
 
 class Country(db.Model):
@@ -98,6 +100,8 @@ class News(db.Model):
     id = db.Column(db.Integer, primary_key=True)
     title = db.Column(db.String(160), nullable=False)
     body = db.Column(db.Text, nullable=False)
+    image_url = db.Column(db.String(500), default="", nullable=False)
+    video_url = db.Column(db.String(500), default="", nullable=False)
     target = db.Column(db.String(40), default="همه کشورها", nullable=False)
     created_at = db.Column(db.DateTime, default=datetime.utcnow, nullable=False)
 
@@ -124,9 +128,13 @@ class ShopItem(db.Model):
     id = db.Column(db.Integer, primary_key=True)
     name = db.Column(db.String(100), nullable=False, unique=True)
     price = db.Column(db.Integer, nullable=False, default=0)
-    description = db.Column(db.String(300), default="", nullable=False)
+    description = db.Column(db.Text, default="", nullable=False)
     # Optional direct checkout price in Iranian toman; legacy credit price is untouched.
     direct_price_toman = db.Column(db.Integer, nullable=True)
+    quantity = db.Column(db.Integer, default=0, nullable=False)
+    image_url = db.Column(db.String(500), default="", nullable=False)
+    discount_percent = db.Column(db.Integer, default=0, nullable=False)
+    active = db.Column(db.Boolean, default=True, nullable=False)
 
 class ShopPaymentOrder(db.Model):
     id = db.Column(db.Integer, primary_key=True)
@@ -137,6 +145,7 @@ class ShopPaymentOrder(db.Model):
     authority = db.Column(db.String(100), unique=True, nullable=True, index=True)
     status = db.Column(db.String(30), nullable=False, default="pending")
     ref_id = db.Column(db.String(100), nullable=True)
+    payment_method = db.Column(db.String(30), default="gateway", nullable=False)
     created_at = db.Column(db.DateTime, default=datetime.utcnow, nullable=False)
 
 class AppSetting(db.Model):
@@ -269,7 +278,7 @@ def superpowers():
 def news_page():
     form = NewsForm()
     if current_user.is_authenticated and current_user.role == "admin" and form.validate_on_submit():
-        db.session.add(News(title=form.title.data.strip(), body=form.body.data.strip(), target=form.target.data))
+        db.session.add(News(title=form.title.data.strip(), body=form.body.data.strip(), target=form.target.data, image_url=(request.form.get("image_url") or "").strip()[:500], video_url=(request.form.get("video_url") or "").strip()[:500]))
         db.session.commit(); flash("خبر منتشر شد.", "success"); return redirect(url_for("news_page"))
     items = News.query.order_by(News.created_at.desc()).all()
     return render_template("news.html", news=items, form=form)
@@ -279,10 +288,16 @@ def news_page():
 def diplomacy():
     form = DiplomacyForm()
     form.target_country.choices = [(c.id, f"{c.flag} {c.name}") for c in Country.query.filter(Country.id != (current_user.country_id or -1)).order_by(Country.name).all()]
-    if form.validate_on_submit():
+    if current_user.diplomacy_blocked:
+        flash("دسترسی شما به دیپلماسی توسط مالک محدود شده است.", "error")
+    elif form.validate_on_submit():
         target = db.session.get(Country, form.target_country.data)
         if not target or target.id == current_user.country_id:
             flash("کشور مقابل معتبر نیست.", "error")
+        elif form.kind.data == "اتحاد" and DiplomaticRequest.query.filter_by(kind="اتحاد", status="پذیرفته شد", target_country_id=target.id, user_id=current_user.id).first():
+            flash("پیشنهاد اتحاد با این کشور قبلاً پذیرفته شده است.", "error")
+        elif form.kind.data == "اتحاد" and current_user.country_id and DiplomaticRequest.query.filter_by(kind="اتحاد", status="پذیرفته شد", target_country_id=current_user.country_id).join(User, DiplomaticRequest.user_id == User.id).filter(User.country_id == target.id).first():
+            flash("این کشور از قبل متحد شماست.", "error")
         else:
             db.session.add(DiplomaticRequest(user_id=current_user.id, kind=form.kind.data, details=(form.details.data or "").strip(), target_country_id=target.id, trade_details=(form.trade_details.data or "").strip()))
             db.session.commit(); flash("پیشنهاد دیپلماتیک ارسال شد.", "success"); return redirect(url_for("diplomacy"))
@@ -327,53 +342,37 @@ def diplomacy_respond(req_id):
 @app.route("/shop")
 @login_required
 def shop():
-    items = ShopItem.query.order_by(ShopItem.id).all()
+    items = ShopItem.query.filter_by(active=True).order_by(ShopItem.id).all()
     purchases = Purchase.query.filter_by(user_id=current_user.id).order_by(Purchase.created_at.desc()).all()
-    return render_template("shop.html", items=items, purchases=purchases)
+    setting = AppSetting.query.filter_by(key="shop_discount_percent").first()
+    global_discount = int(setting.value) if setting else 0
+    display_prices = {}
+    for item in items:
+        discount = max(global_discount, item.discount_percent or 0)
+        display_prices[item.id] = max(0, round(item.price * (100 - discount) / 100))
+    return render_template("shop.html", items=items, purchases=purchases, display_prices=display_prices, global_discount=global_discount)
 
 @app.route("/shop/pay/<int:item_id>", methods=["POST"])
 @login_required
 def shop_pay(item_id):
-    """Directly buy a shop item; never adds wallet credit. Requires a configured Zarinpal merchant."""
+    """Create a manual-transfer order; the owner must verify payment before delivery."""
     item = db.session.get(ShopItem, item_id)
-    if not item:
-        abort(404)
+    if not item or not item.active or item.quantity < 1:
+        flash("این محصول فعلاً ناموجود است.", "error")
+        return redirect(url_for("shop"))
     if not item.direct_price_toman or item.direct_price_toman < 1:
-        flash("پرداخت مستقیم برای این آیتم توسط مدیر فعال نشده است.", "error")
+        flash("پرداخت مستقیم برای این محصول توسط مالک فعال نشده است.", "error")
         return redirect(url_for("shop"))
-    merchant_id = (os.environ.get("ZARINPAL_MERCHANT_ID") or "").strip()
-    if not merchant_id:
-        flash("درگاه هنوز توسط مدیر پیکربندی نشده است.", "error")
-        return redirect(url_for("shop"))
+    discount = item.discount_percent or 0
+    global_discount = AppSetting.query.filter_by(key="shop_discount_percent").first()
+    if global_discount:
+        discount = max(discount, min(90, max(0, int(global_discount.value))))
+    amount = max(1, round(item.direct_price_toman * (100 - discount) / 100))
     order = ShopPaymentOrder(user_id=current_user.id, item_id=item.id, item_name=item.name,
-                             amount_toman=item.direct_price_toman, status="pending")
-    db.session.add(order)
-    db.session.commit()
-    sandbox = os.environ.get("ZARINPAL_SANDBOX", "0").strip().lower() in ("1", "true", "yes")
-    api_base = "https://sandbox.zarinpal.com/pg/v4/payment" if sandbox else "https://api.zarinpal.com/pg/v4/payment"
-    callback_url = url_for("shop_payment_callback", _external=True, order_id=order.id)
-    payload = {
-        "merchant_id": merchant_id,
-        "amount": order.amount_toman * 10,  # Zarinpal API amount is in rials.
-        "callback_url": callback_url,
-        "description": f"خرید مستقیم شاپ ICE Nice: {item.name}",
-        "metadata": {"order_id": str(order.id), "email": "", "mobile": ""},
-    }
-    try:
-        response = requests.post(f"{api_base}/request.json", json=payload, timeout=15)
-        data = response.json().get("data", {})
-        if response.ok and data.get("code") in (100, 101) and data.get("authority"):
-            order.authority = data["authority"]
-            db.session.commit()
-            start_base = "https://sandbox.zarinpal.com/pg/StartPay" if sandbox else "https://www.zarinpal.com/pg/StartPay"
-            return redirect(f"{start_base}/{order.authority}")
-        app.logger.warning("Zarinpal request rejected for order %s: %s", order.id, response.text[:500])
-    except (requests.RequestException, ValueError) as exc:
-        app.logger.warning("Zarinpal request failed for order %s: %s", order.id, exc)
-    order.status = "gateway_error"
-    db.session.commit()
-    flash("اتصال به درگاه انجام نشد؛ پرداختی ثبت نشده است.", "error")
-    return redirect(url_for("shop"))
+                             amount_toman=amount, status="manual_pending", payment_method="card_transfer")
+    db.session.add(order); db.session.commit()
+    return render_template("manual_payment.html", order=order, item=item,
+                           card_number="6219861357182780", account_name="باقرپور", rubika_id="@IP_mamad2")
 
 @app.route("/shop/payment/callback/<int:order_id>", methods=["GET"])
 @login_required
@@ -381,6 +380,8 @@ def shop_payment_callback(order_id):
     order = db.session.get(ShopPaymentOrder, order_id)
     if not order or order.user_id != current_user.id:
         abort(404)
+    if order.payment_method == "card_transfer":
+        abort(400)
     if order.status == "paid":
         flash("این خرید قبلاً تأیید شده است.", "success")
         return redirect(url_for("shop"))
@@ -429,15 +430,35 @@ def shop_payment_callback(order_id):
 def buy(item_id):
     item = db.session.get(ShopItem, item_id)
     if not item: abort(404)
-    if current_user.balance < item.price:
+    setting = AppSetting.query.filter_by(key="shop_discount_percent").first()
+    global_discount = int(setting.value) if setting else 0
+    discount = max(global_discount, item.discount_percent or 0)
+    final_price = max(0, round(item.price * (100 - discount) / 100))
+    if not item.active or item.quantity < 1:
+        flash("این محصول ناموجود است.", "error")
+    elif current_user.balance < final_price:
         flash("اعتبار کافی نیست. با مدیر تماس بگیر.", "error")
     else:
-        current_user.balance -= item.price
-        db.session.add(Purchase(user_id=current_user.id, item=item.name, price=item.price))
+        current_user.balance -= final_price
+        item.quantity -= 1
+        if item.quantity == 0: item.active = False
+        db.session.add(Purchase(user_id=current_user.id, item=item.name, price=final_price))
         if item.name in ("🎗️ نشان CIP", "🏅 نشان VIP"):
             current_user.badges = ",".join(filter(None, [current_user.badges, item.name]))
         db.session.commit(); flash("خرید ثبت شد.", "success")
     return redirect(url_for("shop"))
+
+def save_shop_image(upload):
+    if not upload or not upload.filename:
+        return None
+    filename = secure_filename(upload.filename)
+    if not filename or not filename.lower().endswith((".png", ".jpg", ".jpeg", ".webp", ".gif")):
+        raise ValueError("فرمت عکس باید PNG، JPG، WEBP یا GIF باشد.")
+    upload_dir = os.path.join(app.static_folder, "uploads")
+    os.makedirs(upload_dir, exist_ok=True)
+    filename = f"{int(datetime.utcnow().timestamp())}_{filename}"
+    upload.save(os.path.join(upload_dir, filename))
+    return url_for("static", filename="uploads/" + filename)
 
 @app.route("/admin", methods=["GET", "POST"])
 @login_required
@@ -457,13 +478,73 @@ def admin():
             amount = request.form.get("balance", type=int)
             if u and amount is not None and amount >= 0:
                 u.balance = amount; db.session.commit(); flash(f"اعتبار {u.username} به‌روزرسانی شد.", "success")
+        elif action == "shop_discount":
+            percent = request.form.get("discount_percent", type=int)
+            if percent is not None and 0 <= percent <= 90:
+                setting = AppSetting.query.filter_by(key="shop_discount_percent").first()
+                if not setting:
+                    setting = AppSetting(key="shop_discount_percent", value=str(percent)); db.session.add(setting)
+                else: setting.value = str(percent)
+                db.session.commit(); flash("تخفیف عمومی شاپ ذخیره شد.", "success")
+            else: flash("درصد تخفیف باید بین صفر تا ۹۰ باشد.", "error")
+        elif action == "shop_update":
+            item = db.session.get(ShopItem, request.form.get("item_id", type=int))
+            if item:
+                quantity = request.form.get("quantity", type=int)
+                discount = request.form.get("discount_percent", type=int)
+                direct_price = request.form.get("direct_price_toman", type=int)
+                if quantity is not None and quantity >= 0 and discount is not None and 0 <= discount <= 90 and (direct_price is None or direct_price >= 1):
+                    item.name = (request.form.get("name") or item.name).strip()[:100]
+                    item.price = max(0, request.form.get("price", type=int) or 0)
+                    item.description = (request.form.get("description") or "").strip()
+                    item.quantity = quantity; item.discount_percent = discount
+                    item.direct_price_toman = direct_price
+                    item.image_url = (request.form.get("image_url") or "").strip()[:500] or item.image_url
+                    try:
+                        uploaded_image = save_shop_image(request.files.get("image_file"))
+                        if uploaded_image: item.image_url = uploaded_image
+                    except ValueError as exc:
+                        flash(str(exc), "error"); return redirect(url_for("admin"))
+                    item.active = quantity > 0
+                    db.session.commit(); flash("محصول به‌روزرسانی شد.", "success")
+                else: flash("موجودی، قیمت یا تخفیف معتبر نیست.", "error")
+        elif action == "diplomacy_delete":
+            r = db.session.get(DiplomaticRequest, request.form.get("request_id", type=int))
+            if r: db.session.delete(r); db.session.commit(); flash("درخواست دیپلماتیک حذف شد.", "success")
+        elif action == "diplomacy_block":
+            u = db.session.get(User, request.form.get("user_id", type=int))
+            if u and u.role != "admin":
+                u.diplomacy_blocked = request.form.get("blocked") == "1"
+                db.session.commit(); flash("دسترسی دیپلماسی کاربر به‌روزرسانی شد.", "success")
+        elif action == "manual_payment_approve":
+            order = db.session.get(ShopPaymentOrder, request.form.get("order_id", type=int))
+            if order and order.status == "manual_pending" and order.payment_method == "card_transfer":
+                item = db.session.get(ShopItem, order.item_id)
+                if item and item.quantity > 0:
+                    item.quantity -= 1; item.active = item.quantity > 0
+                    order.status = "paid"
+                    db.session.add(Purchase(user_id=order.user_id, item=order.item_name, price=0))
+                    db.session.commit(); flash("پرداخت دستی تأیید و محصول تحویل شد.", "success")
+                else: flash("موجودی محصول کافی نیست؛ خرید تأیید نشد.", "error")
+        elif action == "manual_payment_reject":
+            order = db.session.get(ShopPaymentOrder, request.form.get("order_id", type=int))
+            if order and order.status == "manual_pending":
+                order.status = "rejected"; db.session.commit(); flash("سفارش رد شد.", "success")
         elif action == "shop_add":
             name = (request.form.get("name") or "").strip()
             price = request.form.get("price", type=int)
             direct_price = request.form.get("direct_price_toman", type=int)
             description = (request.form.get("description") or "").strip()
-            if name and price is not None and price >= 0 and len(name) <= 100 and not ShopItem.query.filter_by(name=name).first() and (direct_price is None or direct_price >= 1):
-                db.session.add(ShopItem(name=name, price=price, description=description[:300], direct_price_toman=direct_price)); db.session.commit(); flash("آیتم شاپ اضافه شد.", "success")
+            quantity = request.form.get("quantity", type=int)
+            discount = request.form.get("discount_percent", type=int) or 0
+            image_url = (request.form.get("image_url") or "").strip()[:500]
+            try:
+                uploaded_image = save_shop_image(request.files.get("image_file"))
+                if uploaded_image: image_url = uploaded_image
+            except ValueError as exc:
+                flash(str(exc), "error"); return redirect(url_for("admin"))
+            if name and price is not None and price >= 0 and len(name) <= 100 and not ShopItem.query.filter_by(name=name).first() and (direct_price is None or direct_price >= 1) and quantity is not None and quantity >= 0 and 0 <= discount <= 90:
+                db.session.add(ShopItem(name=name, price=price, description=description, direct_price_toman=direct_price, quantity=quantity, discount_percent=discount, image_url=image_url, active=quantity > 0)); db.session.commit(); flash("آیتم شاپ اضافه شد.", "success")
             else: flash("نام باید یکتا باشد؛ قیمت اعتبار صفر یا بیشتر و قیمت پرداخت مستقیم خالی یا حداقل یک تومان باشد.", "error")
         elif action == "shop_delete":
             item = db.session.get(ShopItem, request.form.get("item_id", type=int))
@@ -490,7 +571,9 @@ def admin():
     users = User.query.order_by(User.username).all()
     requests_list = DiplomaticRequest.query.order_by(DiplomaticRequest.created_at.desc()).limit(50).all()
     items = ShopItem.query.order_by(ShopItem.id).all()
-    return render_template("admin.html", users=users, countries=countries, requests=requests_list, items=items, top20=Country.query.filter(Country.superpower_rank.isnot(None)).order_by(Country.superpower_rank).all())
+    manual_orders = ShopPaymentOrder.query.filter_by(payment_method="card_transfer", status="manual_pending").order_by(ShopPaymentOrder.created_at.desc()).all()
+    shop_discount = AppSetting.query.filter_by(key="shop_discount_percent").first()
+    return render_template("admin.html", users=users, countries=countries, requests=requests_list, items=items, manual_orders=manual_orders, shop_discount=int(shop_discount.value) if shop_discount else 0, top20=Country.query.filter(Country.superpower_rank.isnot(None)).order_by(Country.superpower_rank).all())
 
 @app.route("/admin/request/<int:req_id>", methods=["POST"])
 @login_required
@@ -514,9 +597,12 @@ def not_found(_):
 def migrate_schema():
     inspector = inspect(db.engine)
     additions = {
+        "user": {"diplomacy_blocked": "BOOLEAN DEFAULT 0"},
+        "news": {"image_url": "VARCHAR(500) DEFAULT ''", "video_url": "VARCHAR(500) DEFAULT ''"},
         "country": {"flag": "VARCHAR(16) DEFAULT '🏳️'", "category": "VARCHAR(20) DEFAULT 'country'", "superpower_rank": "INTEGER"},
         "diplomatic_request": {"target_country_id": "INTEGER", "trade_details": "TEXT DEFAULT ''"},
-        "shop_item": {"direct_price_toman": "INTEGER"},
+        "shop_item": {"direct_price_toman": "INTEGER", "quantity": "INTEGER DEFAULT 0", "image_url": "VARCHAR(500) DEFAULT ''", "discount_percent": "INTEGER DEFAULT 0", "active": "BOOLEAN DEFAULT 1"},
+        "shop_payment_order": {"payment_method": "VARCHAR(30) DEFAULT 'gateway'"},
     }
     for table, columns in additions.items():
         if table in inspector.get_table_names():
@@ -525,6 +611,9 @@ def migrate_schema():
                 if col not in present:
                     with db.engine.begin() as conn:
                         conn.execute(text(f'ALTER TABLE "{table}" ADD COLUMN "{col}" {definition}'))
+    if "shop_item" in inspector.get_table_names():
+        with db.engine.begin() as conn:
+            conn.execute(text('UPDATE shop_item SET quantity = 9999 WHERE quantity = 0 AND active = 1'))
 
 def init_db():
     with app.app_context():
@@ -535,6 +624,10 @@ def init_db():
             old_country = Country.query.filter_by(name=old).first()
             if old_country and not Country.query.filter_by(name=new).first():
                 old_country.name = new
+        db.session.commit()
+        palette = ["#2563eb", "#dc2626", "#16a34a", "#9333ea", "#ea580c", "#0891b2", "#be123c", "#4f46e5", "#65a30d", "#c026d3", "#0f766e", "#b45309", "#1d4ed8", "#a21caf", "#047857", "#b91c1c", "#0369a1", "#6d28d9", "#4d7c0f", "#9f1239"]
+        for idx, country in enumerate(Country.query.filter_by(category="country").order_by(Country.name).all()):
+            if not country.color or country.color == "#718096": country.color = palette[idx % len(palette)]
         db.session.commit()
         top_ids = {name: rank for rank, (_, name) in enumerate(TOP_COUNTRIES, start=1)}
         seed = TOP_COUNTRIES + OTHER_COUNTRIES + ORGANIZATIONS
