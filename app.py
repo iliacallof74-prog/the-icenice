@@ -611,9 +611,8 @@ def migrate_schema():
                 if col not in present:
                     with db.engine.begin() as conn:
                         conn.execute(text(f'ALTER TABLE "{table}" ADD COLUMN "{col}" {definition}'))
-    if "shop_item" in inspector.get_table_names():
-        with db.engine.begin() as conn:
-            conn.execute(text('UPDATE shop_item SET quantity = 9999 WHERE quantity = 0 AND active = 1'))
+    # Do not auto-restock zero-quantity products on startup. Zero means sold out;
+    # an automatic UPDATE here would resurrect sold-out items on every deploy.
 
 def init_db():
     with app.app_context():
