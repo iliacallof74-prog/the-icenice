@@ -597,11 +597,11 @@ def not_found(_):
 def migrate_schema():
     inspector = inspect(db.engine)
     additions = {
-        "user": {"diplomacy_blocked": "BOOLEAN DEFAULT 0"},
+        "user": {"diplomacy_blocked": "BOOLEAN DEFAULT FALSE"},
         "news": {"image_url": "VARCHAR(500) DEFAULT ''", "video_url": "VARCHAR(500) DEFAULT ''"},
         "country": {"flag": "VARCHAR(16) DEFAULT '🏳️'", "category": "VARCHAR(20) DEFAULT 'country'", "superpower_rank": "INTEGER"},
         "diplomatic_request": {"target_country_id": "INTEGER", "trade_details": "TEXT DEFAULT ''"},
-        "shop_item": {"direct_price_toman": "INTEGER", "quantity": "INTEGER DEFAULT 0", "image_url": "VARCHAR(500) DEFAULT ''", "discount_percent": "INTEGER DEFAULT 0", "active": "BOOLEAN DEFAULT 1"},
+        "shop_item": {"direct_price_toman": "INTEGER", "quantity": "INTEGER DEFAULT 0", "image_url": "VARCHAR(500) DEFAULT ''", "discount_percent": "INTEGER DEFAULT 0", "active": "BOOLEAN DEFAULT TRUE"},
         "shop_payment_order": {"payment_method": "VARCHAR(30) DEFAULT 'gateway'"},
     }
     for table, columns in additions.items():
