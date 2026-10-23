@@ -1,6 +1,8 @@
 import os
 from datetime import datetime
 from flask import Flask, render_template, redirect, url_for, request, flash, abort
+from urllib.parse import urlencode
+import requests
 from flask_sqlalchemy import SQLAlchemy
 from flask_login import LoginManager, UserMixin, login_user, logout_user, login_required, current_user
 from flask_wtf import FlaskForm
@@ -123,6 +125,19 @@ class ShopItem(db.Model):
     name = db.Column(db.String(100), nullable=False, unique=True)
     price = db.Column(db.Integer, nullable=False, default=0)
     description = db.Column(db.String(300), default="", nullable=False)
+    # Optional direct checkout price in Iranian toman; legacy credit price is untouched.
+    direct_price_toman = db.Column(db.Integer, nullable=True)
+
+class ShopPaymentOrder(db.Model):
+    id = db.Column(db.Integer, primary_key=True)
+    user_id = db.Column(db.Integer, db.ForeignKey("user.id"), nullable=False, index=True)
+    item_id = db.Column(db.Integer, db.ForeignKey("shop_item.id"), nullable=False)
+    item_name = db.Column(db.String(100), nullable=False)
+    amount_toman = db.Column(db.Integer, nullable=False)
+    authority = db.Column(db.String(100), unique=True, nullable=True, index=True)
+    status = db.Column(db.String(30), nullable=False, default="pending")
+    ref_id = db.Column(db.String(100), nullable=True)
+    created_at = db.Column(db.DateTime, default=datetime.utcnow, nullable=False)
 
 class AppSetting(db.Model):
     key = db.Column(db.String(80), primary_key=True)
@@ -316,6 +331,99 @@ def shop():
     purchases = Purchase.query.filter_by(user_id=current_user.id).order_by(Purchase.created_at.desc()).all()
     return render_template("shop.html", items=items, purchases=purchases)
 
+@app.route("/shop/pay/<int:item_id>", methods=["POST"])
+@login_required
+def shop_pay(item_id):
+    """Directly buy a shop item; never adds wallet credit. Requires a configured Zarinpal merchant."""
+    item = db.session.get(ShopItem, item_id)
+    if not item:
+        abort(404)
+    if not item.direct_price_toman or item.direct_price_toman < 1:
+        flash("پرداخت مستقیم برای این آیتم توسط مدیر فعال نشده است.", "error")
+        return redirect(url_for("shop"))
+    merchant_id = (os.environ.get("ZARINPAL_MERCHANT_ID") or "").strip()
+    if not merchant_id:
+        flash("درگاه هنوز توسط مدیر پیکربندی نشده است.", "error")
+        return redirect(url_for("shop"))
+    order = ShopPaymentOrder(user_id=current_user.id, item_id=item.id, item_name=item.name,
+                             amount_toman=item.direct_price_toman, status="pending")
+    db.session.add(order)
+    db.session.commit()
+    sandbox = os.environ.get("ZARINPAL_SANDBOX", "0").strip().lower() in ("1", "true", "yes")
+    api_base = "https://sandbox.zarinpal.com/pg/v4/payment" if sandbox else "https://api.zarinpal.com/pg/v4/payment"
+    callback_url = url_for("shop_payment_callback", _external=True, order_id=order.id)
+    payload = {
+        "merchant_id": merchant_id,
+        "amount": order.amount_toman * 10,  # Zarinpal API amount is in rials.
+        "callback_url": callback_url,
+        "description": f"خرید مستقیم شاپ ICE Nice: {item.name}",
+        "metadata": {"order_id": str(order.id), "email": "", "mobile": ""},
+    }
+    try:
+        response = requests.post(f"{api_base}/request.json", json=payload, timeout=15)
+        data = response.json().get("data", {})
+        if response.ok and data.get("code") in (100, 101) and data.get("authority"):
+            order.authority = data["authority"]
+            db.session.commit()
+            start_base = "https://sandbox.zarinpal.com/pg/StartPay" if sandbox else "https://www.zarinpal.com/pg/StartPay"
+            return redirect(f"{start_base}/{order.authority}")
+        app.logger.warning("Zarinpal request rejected for order %s: %s", order.id, response.text[:500])
+    except (requests.RequestException, ValueError) as exc:
+        app.logger.warning("Zarinpal request failed for order %s: %s", order.id, exc)
+    order.status = "gateway_error"
+    db.session.commit()
+    flash("اتصال به درگاه انجام نشد؛ پرداختی ثبت نشده است.", "error")
+    return redirect(url_for("shop"))
+
+@app.route("/shop/payment/callback/<int:order_id>", methods=["GET"])
+@login_required
+def shop_payment_callback(order_id):
+    order = db.session.get(ShopPaymentOrder, order_id)
+    if not order or order.user_id != current_user.id:
+        abort(404)
+    if order.status == "paid":
+        flash("این خرید قبلاً تأیید شده است.", "success")
+        return redirect(url_for("shop"))
+    if request.args.get("Status", "").upper() != "OK" or not order.authority:
+        order.status = "cancelled"
+        db.session.commit()
+        flash("پرداخت لغو شد یا تأیید نشد؛ آیتمی تحویل داده نشد.", "error")
+        return redirect(url_for("shop"))
+    merchant_id = (os.environ.get("ZARINPAL_MERCHANT_ID") or "").strip()
+    if not merchant_id:
+        flash("تنظیمات درگاه ناقص است؛ با مدیر تماس بگیر.", "error")
+        return redirect(url_for("shop"))
+    sandbox = os.environ.get("ZARINPAL_SANDBOX", "0").strip().lower() in ("1", "true", "yes")
+    api_base = "https://sandbox.zarinpal.com/pg/v4/payment" if sandbox else "https://api.zarinpal.com/pg/v4/payment"
+    try:
+        response = requests.post(f"{api_base}/verify.json", json={
+            "merchant_id": merchant_id,
+            "amount": order.amount_toman * 10,
+            "authority": order.authority,
+        }, timeout=15)
+        data = response.json().get("data", {})
+        code = data.get("code")
+        if response.ok and code in (100, 101):
+            order.status = "paid"
+            order.ref_id = str(data.get("ref_id", ""))
+            # Deliver the item exactly once, after server-side gateway verification.
+            db.session.add(Purchase(user_id=order.user_id, item=order.item_name, price=0))
+            if order.item_name in ("🎗️ نشان CIP", "🏅 نشان VIP"):
+                buyer = db.session.get(User, order.user_id)
+                if buyer:
+                    buyer.badges = ",".join(filter(None, [buyer.badges, order.item_name]))
+            db.session.commit()
+            flash(f"پرداخت تأیید شد و آیتم «{order.item_name}» به خریدهای شما اضافه شد. کد پیگیری: {order.ref_id}", "success")
+        else:
+            app.logger.warning("Zarinpal verify rejected order %s: %s", order.id, response.text[:500])
+            order.status = "verification_failed"
+            db.session.commit()
+            flash("درگاه پرداخت را تأیید نکرد؛ آیتم تحویل داده نشد.", "error")
+    except (requests.RequestException, ValueError) as exc:
+        app.logger.warning("Zarinpal verify failed for order %s: %s", order.id, exc)
+        flash("بررسی پرداخت موقتاً ناموفق بود؛ با مدیر تماس بگیر و دوباره پرداخت نکن.", "error")
+    return redirect(url_for("shop"))
+
 @app.route("/shop/buy/<int:item_id>", methods=["POST"])
 @login_required
 def buy(item_id):
@@ -352,10 +460,11 @@ def admin():
         elif action == "shop_add":
             name = (request.form.get("name") or "").strip()
             price = request.form.get("price", type=int)
+            direct_price = request.form.get("direct_price_toman", type=int)
             description = (request.form.get("description") or "").strip()
-            if name and price is not None and price >= 0 and len(name) <= 100 and not ShopItem.query.filter_by(name=name).first():
-                db.session.add(ShopItem(name=name, price=price, description=description[:300])); db.session.commit(); flash("آیتم شاپ اضافه شد.", "success")
-            else: flash("نام باید یکتا باشد و قیمت صفر یا بیشتر وارد شود.", "error")
+            if name and price is not None and price >= 0 and len(name) <= 100 and not ShopItem.query.filter_by(name=name).first() and (direct_price is None or direct_price >= 1):
+                db.session.add(ShopItem(name=name, price=price, description=description[:300], direct_price_toman=direct_price)); db.session.commit(); flash("آیتم شاپ اضافه شد.", "success")
+            else: flash("نام باید یکتا باشد؛ قیمت اعتبار صفر یا بیشتر و قیمت پرداخت مستقیم خالی یا حداقل یک تومان باشد.", "error")
         elif action == "shop_delete":
             item = db.session.get(ShopItem, request.form.get("item_id", type=int))
             if item:
@@ -407,6 +516,7 @@ def migrate_schema():
     additions = {
         "country": {"flag": "VARCHAR(16) DEFAULT '🏳️'", "category": "VARCHAR(20) DEFAULT 'country'", "superpower_rank": "INTEGER"},
         "diplomatic_request": {"target_country_id": "INTEGER", "trade_details": "TEXT DEFAULT ''"},
+        "shop_item": {"direct_price_toman": "INTEGER"},
     }
     for table, columns in additions.items():
         if table in inspector.get_table_names():
