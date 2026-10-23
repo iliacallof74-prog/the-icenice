@@ -105,7 +105,9 @@ class News(db.Model):
     title = db.Column(db.String(160), nullable=False)
     body = db.Column(db.Text, nullable=False)
     image_url = db.Column(db.String(500), default="", nullable=False)
-    video_url = db.Column(db.String(500), default="", nullable=False)
+video_url = db.Column(db.String(500), default="", nullable=False)
+image_data = db.Column(db.LargeBinary, nullable=True)
+video_data = db.Column(db.LargeBinary, nullable=True)
     target = db.Column(db.String(40), default="همه کشورها", nullable=False)
     created_at = db.Column(db.DateTime, default=datetime.utcnow, nullable=False)
 
