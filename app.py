@@ -1,7 +1,9 @@
 import os
 import uuid
 from datetime import datetime
-from flask import Flask, render_template, redirect, url_for, request, flash, abort
+from io import BytesIO
+import mimetypes
+from flask import Flask, render_template, redirect, url_for, request, flash, abort, send_file
 from urllib.parse import urlencode
 import requests
 from flask_sqlalchemy import SQLAlchemy
@@ -11,7 +13,7 @@ from wtforms import StringField, PasswordField, SelectField, TextAreaField, Subm
 from wtforms.validators import DataRequired, Length
 from werkzeug.security import generate_password_hash, check_password_hash
 from werkzeug.utils import secure_filename
-from sqlalchemy import inspect, text, or_
+from sqlalchemy import inspect, text, or_, LargeBinary
 from sqlalchemy.exc import IntegrityError
 
 app = Flask(__name__)
@@ -105,11 +107,15 @@ class News(db.Model):
     title = db.Column(db.String(160), nullable=False)
     body = db.Column(db.Text, nullable=False)
     image_url = db.Column(db.String(500), default="", nullable=False)
-video_url = db.Column(db.String(500), default="", nullable=False)
-image_data = db.Column(db.LargeBinary, nullable=True)
-video_data = db.Column(db.LargeBinary, nullable=True)
+    video_url = db.Column(db.String(500), default="", nullable=False)
     target = db.Column(db.String(40), default="همه کشورها", nullable=False)
-    created_at = db.Column(db.DateTime, default=datetime.utcnow, nullable=False)
+    created_at = db.Column(db.DateTime, default=datetime.utcnow, nullable=False, index=True)
+    image_data = db.Column(LargeBinary, nullable=True)
+    image_mimetype = db.Column(db.String(100), nullable=True)
+    image_filename = db.Column(db.String(255), nullable=True)
+    video_data = db.Column(LargeBinary, nullable=True)
+    video_mimetype = db.Column(db.String(100), nullable=True)
+    video_filename = db.Column(db.String(255), nullable=True)
 
 class DiplomaticRequest(db.Model):
     id = db.Column(db.Integer, primary_key=True)
@@ -197,7 +203,7 @@ def inject_globals():
 
 @app.route("/")
 def index():
-    latest_news = News.query.order_by(News.created_at.desc()).limit(5).all()
+    latest_news = News.query.order_by(News.created_at.desc(), News.id.desc()).limit(1).all()
     top20 = Country.query.filter(Country.superpower_rank.isnot(None)).order_by(Country.superpower_rank).all()
     return render_template("index.html", news=latest_news, top20=top20, countries_count=Country.query.filter_by(category="country").count(), organizations_count=Country.query.filter_by(category="organization").count())
 
@@ -287,21 +293,27 @@ def news_page():
         image_url = (request.form.get("image_url") or "").strip()[:500]
         video_url = (request.form.get("video_url") or "").strip()[:500]
         try:
-            uploaded_image = save_news_media(request.files.get("image_file"), "image")
-            uploaded_video = save_news_media(request.files.get("video_file"), "video")
-            if uploaded_image:
-                image_url = uploaded_image
-            if uploaded_video:
-                video_url = uploaded_video
+            uploaded_image = read_news_media(request.files.get("image_file"), "image")
+            uploaded_video = read_news_media(request.files.get("video_file"), "video")
         except ValueError as exc:
             flash(str(exc), "error")
             return redirect(url_for("news_page"))
-        db.session.add(News(title=form.title.data.strip(), body=form.body.data.strip(), target=form.target.data,
-                            image_url=image_url, video_url=video_url))
+        news_item = News(title=form.title.data.strip(), body=form.body.data.strip(), target=form.target.data,
+                         image_url=image_url, video_url=video_url)
+        if uploaded_image:
+            news_item.image_data, news_item.image_mimetype, news_item.image_filename = uploaded_image["data"], uploaded_image["mimetype"], uploaded_image["filename"]
+        if uploaded_video:
+            news_item.video_data, news_item.video_mimetype, news_item.video_filename = uploaded_video["data"], uploaded_video["mimetype"], uploaded_video["filename"]
+        db.session.add(news_item)
+        db.session.flush()
+        if uploaded_image:
+            news_item.image_url = url_for("news_media", news_id=news_item.id, media_type="image")
+        if uploaded_video:
+            news_item.video_url = url_for("news_media", news_id=news_item.id, media_type="video")
         db.session.commit()
         flash("خبر منتشر شد.", "success")
         return redirect(url_for("news_page"))
-    items = News.query.order_by(News.created_at.desc()).all()
+    items = News.query.order_by(News.created_at.desc(), News.id.desc()).all()
     return render_template("news.html", news=items, form=form)
 
 @app.route("/diplomacy", methods=["GET", "POST"])
@@ -482,25 +494,65 @@ def save_shop_image(upload):
     return url_for("static", filename="uploads/" + filename)
 
 
-def save_news_media(upload, media_type):
-    """Save an uploaded news image or video under static/uploads with a unique filename."""
+def read_news_media(upload, media_type):
     if not upload or not upload.filename:
         return None
     filename = secure_filename(upload.filename)
     ext = os.path.splitext(filename)[1].lower()
-    allowed = {
-        "image": {".png", ".jpg", ".jpeg", ".webp", ".gif"},
-        "video": {".mp4", ".webm", ".mov", ".m4v", ".ogv"},
-    }
+    allowed = {"image": {".png", ".jpg", ".jpeg", ".webp", ".gif"},
+                "video": {".mp4", ".webm", ".mov", ".m4v", ".ogv"}}
     if not filename or ext not in allowed.get(media_type, set()):
-        if media_type == "video":
-            raise ValueError("فرمت ویدیو باید MP4، WEBM، MOV، M4V یا OGV باشد.")
-        raise ValueError("فرمت عکس باید PNG، JPG، WEBP یا GIF باشد.")
-    upload_dir = os.path.join(app.static_folder, "uploads")
-    os.makedirs(upload_dir, exist_ok=True)
-    stored_name = f"news_{media_type}_{uuid.uuid4().hex}{ext}"
-    upload.save(os.path.join(upload_dir, stored_name))
-    return url_for("static", filename="uploads/" + stored_name)
+        raise ValueError("فرمت فایل پشتیبانی نمی‌شود.")
+    data = upload.read()
+    if not data:
+        raise ValueError("فایل آپلودشده خالی است.")
+    return {"data": data, "mimetype": upload.mimetype or mimetypes.guess_type(filename)[0] or "application/octet-stream",
+            "filename": filename}
+
+@app.route("/news-media/<int:news_id>/<media_type>")
+def news_media(news_id, media_type):
+    if media_type not in ("image", "video"):
+        abort(404)
+    item = db.session.get(News, news_id)
+    if not item:
+        abort(404)
+    data = item.image_data if media_type == "image" else item.video_data
+    mimetype = item.image_mimetype if media_type == "image" else item.video_mimetype
+    filename = item.image_filename if media_type == "image" else item.video_filename
+    if not data:
+        abort(404)
+    return send_file(BytesIO(data), mimetype=mimetype or "application/octet-stream",
+                     download_name=filename or f"news-{news_id}-{media_type}", conditional=True, max_age=3600)
+
+@app.cli.command("migrate-news-media")
+def migrate_news_media():
+    """Copy existing legacy media into the database without deleting original files."""
+    migrated = missing = 0
+    with app.app_context():
+        for item in News.query.order_by(News.id).all():
+            for kind in ("image", "video"):
+                data_col, mime_col = f"{kind}_data", f"{kind}_mimetype"
+                filename_col, url_col = f"{kind}_filename", f"{kind}_url"
+                if getattr(item, data_col) or not getattr(item, url_col):
+                    continue
+                url = getattr(item, url_col)
+                prefix = "/static/uploads/"
+                if prefix not in url:
+                    continue
+                filename = os.path.basename(url.split(prefix, 1)[1].split("?", 1)[0])
+                path = os.path.join(app.static_folder, "uploads", filename)
+                if not os.path.isfile(path):
+                    missing += 1
+                    continue
+                with open(path, "rb") as stream:
+                    setattr(item, data_col, stream.read())
+                setattr(item, mime_col, mimetypes.guess_type(filename)[0] or "application/octet-stream")
+                setattr(item, filename_col, filename)
+                setattr(item, url_col, f"/news-media/{item.id}/{kind}")
+                migrated += 1
+        db.session.commit()
+    print(f"Migrated: {migrated}; source files missing: {missing}. Original files were retained.")
+
 
 @app.route("/admin", methods=["GET", "POST"])
 @login_required
@@ -638,6 +690,32 @@ def admin():
     shop_discount = AppSetting.query.filter_by(key="shop_discount_percent").first()
     return render_template("admin.html", users=users, countries=countries, requests=requests_list, items=items, manual_orders=manual_orders, shop_discount=int(shop_discount.value) if shop_discount else 0, top20=Country.query.filter(Country.superpower_rank.isnot(None)).order_by(Country.superpower_rank).all())
 
+@app.route("/news/delete/<int:news_id>", methods=["POST"])
+@login_required
+def delete_news(news_id):
+    admin_required()
+    if request.form.get("confirm_delete") != "yes":
+        abort(400)
+    item = db.session.get(News, news_id)
+    if not item:
+        flash("این خبر قبلاً حذف شده یا وجود ندارد.", "error")
+    else:
+        db.session.delete(item)
+        db.session.commit()
+        flash("خبر حذف شد؛ سایر اطلاعات سایت دست‌نخورده ماندند.", "success")
+    return redirect(url_for("news_page"))
+
+@app.route("/news/delete-all", methods=["POST"])
+@login_required
+def delete_all_news():
+    admin_required()
+    if request.form.get("confirm_delete_all") != "DELETE_ALL_NEWS":
+        abort(400)
+    News.query.delete(synchronize_session=False)
+    db.session.commit()
+    flash("همه خبرها حذف شدند؛ حساب‌ها و سایر بخش‌ها تغییری نکردند.", "success")
+    return redirect(url_for("news_page"))
+
 @app.route("/admin/request/<int:req_id>", methods=["POST"])
 @login_required
 def admin_request(req_id):
@@ -661,7 +739,7 @@ def migrate_schema():
     inspector = inspect(db.engine)
     additions = {
         "user": {"diplomacy_blocked": "BOOLEAN DEFAULT FALSE"},
-        "news": {"image_url": "VARCHAR(500) DEFAULT ''", "video_url": "VARCHAR(500) DEFAULT ''"},
+        "news": {"image_url": "VARCHAR(500) DEFAULT ''", "video_url": "VARCHAR(500) DEFAULT ''", "image_data": "BYTEA", "image_mimetype": "VARCHAR(100)", "image_filename": "VARCHAR(255)", "video_data": "BYTEA", "video_mimetype": "VARCHAR(100)", "video_filename": "VARCHAR(255)"},
         "country": {"flag": "VARCHAR(16) DEFAULT '🏳️'", "category": "VARCHAR(20) DEFAULT 'country'", "superpower_rank": "INTEGER"},
         "diplomatic_request": {"target_country_id": "INTEGER", "trade_details": "TEXT DEFAULT ''"},
         "shop_item": {"direct_price_toman": "INTEGER", "quantity": "INTEGER DEFAULT 0", "image_url": "VARCHAR(500) DEFAULT ''", "discount_percent": "INTEGER DEFAULT 0", "active": "BOOLEAN DEFAULT TRUE"},
